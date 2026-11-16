@@ -30,6 +30,37 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const trunc = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 const row = (...c) => new ActionRowBuilder().addComponents(...c);
 
+/** Split text blocks into pages that fit an embed description, breaking on lines rather than mid-name. */
+function pages(blocks, max = 3800) {
+  const pieces = [];
+  for (const b of blocks) {
+    if (b.length <= max) {
+      pieces.push(b);
+      continue;
+    }
+    let cur = '';
+    for (const line of b.split('\n')) {
+      if (cur && cur.length + line.length + 1 > max) {
+        pieces.push(cur);
+        cur = '';
+      }
+      cur += (cur ? '\n' : '') + trunc(line, max);
+    }
+    if (cur) pieces.push(cur);
+  }
+  const out = [];
+  let cur = '';
+  for (const p of pieces) {
+    if (cur && cur.length + p.length + 2 > max) {
+      out.push(cur);
+      cur = '';
+    }
+    cur += (cur ? '\n\n' : '') + p;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
 process.on('unhandledRejection', (e) => console.error('unhandledRejection', e));
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -254,19 +285,37 @@ async function showCurrent(i, sub) {
   if (!withRows.length) {
     return i.editReply(`No postings yet for **${data.name}** (${wanted.length} event(s) checked).\n${postingsUrl(sub.slug)}`);
   }
-  const embeds = withRows.slice(0, 10).map((e) => {
-    let desc = '';
-    let shown = 0;
-    for (const r of e.rows) {
-      if (desc.length + r.length + 3 > 1500) break;
-      desc += `• ${r}\n`;
-      shown++;
+  const embeds = [];
+  for (const e of withRows) {
+    const ps = pages(e.rows);
+    ps.forEach((d, n) =>
+      embeds.push(
+        new EmbedBuilder()
+          .setTitle(trunc(ps.length > 1 ? `${e.name} (${n + 1}/${ps.length})` : e.name, 256))
+          .setDescription(d)
+          .setURL(postingsUrl(sub.slug)),
+      ),
+    );
+  }
+  // Discord allows 10 embeds and ~6000 characters of embed text per message.
+  const messages = [];
+  let cur = [];
+  let size = 0;
+  for (const em of embeds) {
+    const len = (em.data.title?.length ?? 0) + (em.data.description?.length ?? 0);
+    if (cur.length && (cur.length >= 10 || size + len > 5500)) {
+      messages.push(cur);
+      cur = [];
+      size = 0;
     }
-    if (shown < e.rows.length) desc += `…and ${e.rows.length - shown} more`;
-    return new EmbedBuilder().setTitle(trunc(e.name, 256)).setDescription(desc.trim()).setURL(postingsUrl(sub.slug));
-  });
-  const extra = withRows.length > 10 ? `\n(+${withRows.length - 10} more events — see the page)` : '';
-  return i.editReply({ content: `**${data.name}**${extra}`, embeds });
+    cur.push(em);
+    size += len;
+  }
+  if (cur.length) messages.push(cur);
+  const MAX_MSGS = 6;
+  const more = messages.length > MAX_MSGS ? `\n(showing the first ${MAX_MSGS} messages — open the page for the rest)` : '';
+  await i.editReply({ content: `**${data.name}**${more}`, embeds: messages[0] });
+  for (const m of messages.slice(1, MAX_MSGS)) await i.followUp({ flags: EPHEMERAL, embeds: m });
 }
 
 /* ───────────── interaction routing ───────────── */
@@ -416,6 +465,7 @@ client.on('interactionCreate', async (i) => {
 function diffEvents(prev, data) {
   const changes = [];
   for (const ev of data.events) {
+    if (ev.incomplete) continue; // a round page failed to load; don't announce a partial update
     const old = prev.events[ev.name] ?? [];
     const oldSet = new Set(old);
     const added = ev.rows.filter((r) => !oldSet.has(r));
@@ -430,37 +480,35 @@ async function notify(slug, tournamentName, change) {
     .filter((s) => s.slug === slug && (!s.events.length || s.events.includes(change.event)));
   if (!subs.length) return;
 
-  let desc = '';
-  let shown = 0;
-  for (const r of change.rows) {
-    if (desc.length + r.length + 3 > 3800) break;
-    desc += `• ${r}\n`;
-    shown++;
-  }
-  if (shown < change.rows.length) desc += `…and ${change.rows.length - shown} more — open the page for all of them.`;
-
-  const embed = new EmbedBuilder()
-    .setTitle(trunc(`${change.kind === 'new' ? '📌 Postings are up' : '🔄 Postings updated'} · ${change.event}`, 256))
-    .setURL(postingsUrl(slug))
-    .setDescription(desc.trim())
-    .setFooter({ text: trunc(tournamentName, 2000) })
-    .setTimestamp()
-    .setColor(0x5865f2);
+  const ps = pages(change.rows);
+  const MAX_PAGES = 4;
+  const embeds = ps.slice(0, MAX_PAGES).map((d, n) => {
+    const total = Math.min(ps.length, MAX_PAGES);
+    const head = change.kind === 'new' ? '📌 Postings are up' : '🔄 Postings updated';
+    const e = new EmbedBuilder()
+      .setTitle(trunc(`${head} · ${change.event}${total > 1 ? ` (${n + 1}/${total})` : ''}`, 256))
+      .setURL(postingsUrl(slug))
+      .setDescription(d)
+      .setFooter({ text: trunc(tournamentName, 2000) })
+      .setColor(0x5865f2);
+    if (n === 0) e.setTimestamp();
+    return e;
+  });
+  if (ps.length > MAX_PAGES) embeds[embeds.length - 1].setFooter({ text: trunc(`${tournamentName} — more on the page`, 2000) });
 
   for (const s of subs) {
     try {
-      if (s.channelId) {
-        const ch = await client.channels.fetch(s.channelId);
-        await ch.send({ content: `<@${s.userId}>`, allowedMentions: { users: [s.userId] }, embeds: [embed] });
-      } else {
-        const user = await client.users.fetch(s.userId);
-        await user.send({ embeds: [embed] });
+      const target = s.channelId ? await client.channels.fetch(s.channelId) : await client.users.fetch(s.userId);
+      for (let n = 0; n < embeds.length; n++) {
+        const payload = { embeds: [embeds[n]] };
+        if (s.channelId && n === 0) Object.assign(payload, { content: `<@${s.userId}>`, allowedMentions: { users: [s.userId] } });
+        await target.send(payload);
+        await sleep(300);
       }
     } catch (e) {
       console.warn(`notify failed (sub ${s.id}, code ${e.code}): ${e.message}`);
       if (e.code === 10003) store.removeSubsByChannel(s.channelId); // channel deleted
     }
-    await sleep(300);
   }
 }
 
@@ -483,7 +531,9 @@ async function pollOnce() {
         }
         const changes = diffEvents(prev, data);
         // A transiently empty event must not erase what we already announced.
-        for (const ev of data.events) if (!ev.rows.length && prev.events[ev.name]?.length) ev.rows = prev.events[ev.name];
+        for (const ev of data.events) {
+          if (ev.incomplete || (!ev.rows.length && prev.events[ev.name]?.length)) ev.rows = prev.events[ev.name] ?? [];
+        }
         store.setTournament(slug, data);
         for (const c of changes) await notify(slug, data.name, c);
       } catch (e) {
